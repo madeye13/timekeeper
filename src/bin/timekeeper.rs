@@ -279,26 +279,45 @@ async fn persist_history(persistent_file: &PathBuf, entries: &[MyEntry]) -> anyh
     Ok(())
 }
 
-fn deserialize_sides_jira_matches<'de, D>(
+#[derive(Debug)]
+struct SideAdditionalInfo {
+    jira_summary_regex: Option<Regex>,
+    bookable: bool,
+}
+
+fn deserialize_sides_additional_info<'de, D>(
     deserializer: D,
-) -> Result<HashMap<Facet, Regex>, D::Error>
+) -> Result<HashMap<Facet, SideAdditionalInfo>, D::Error>
 where
     D: de::Deserializer<'de>,
 {
     #[derive(Debug, PartialEq, Eq, Deserialize)]
-    struct SidesJiraMatching {
+    struct ParseAdditionalInfo {
         facet: Facet,
-        jira_summary_regex: String,
+        jira_summary_regex: Option<String>,
+        bookable: Option<bool>,
     }
-    let sides = Vec::<SidesJiraMatching>::deserialize(deserializer)?;
-    let mapped: Result<HashMap<Facet, Regex>, D::Error> = sides
+    let sides = Vec::<ParseAdditionalInfo>::deserialize(deserializer)?;
+    let mapped: Result<HashMap<Facet, SideAdditionalInfo>, D::Error> = sides
         .into_iter()
         .map(|sides| {
-            let regex = RegexBuilder::new(&sides.jira_summary_regex)
-                .case_insensitive(true)
-                .build()
-                .map_err(de::Error::custom)?;
-            Ok((sides.facet, regex))
+            let regex = if let Some(regex) = sides.jira_summary_regex {
+                Some(
+                    RegexBuilder::new(&regex)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(de::Error::custom)?,
+                )
+            } else {
+                None
+            };
+            Ok((
+                sides.facet,
+                SideAdditionalInfo {
+                    jira_summary_regex: regex,
+                    bookable: sides.bookable.unwrap_or(true),
+                },
+            ))
         })
         .collect();
     mapped
@@ -313,8 +332,9 @@ struct MyConfig {
     jira_base_url: String,
     jira_board_id: String,
     jira_jql_issue_filter: String,
-    #[serde(deserialize_with = "deserialize_sides_jira_matches")]
-    sides_jira_matching: HashMap<Facet, Regex>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_sides_additional_info")]
+    sides_additional_info: HashMap<Facet, SideAdditionalInfo>,
 }
 
 async fn read_config(path: impl AsRef<Path>) -> anyhow::Result<MyConfig> {
@@ -339,22 +359,139 @@ fn longest_facet_name(config: &Config) -> usize {
         .unwrap_or_default()
 }
 
-#[derive(Eq, Hash, PartialEq, Ord, PartialOrd)]
+#[derive(Eq, Hash, PartialEq, Ord, PartialOrd, Clone)]
 enum BookingType {
     Jira(String),
-    Unknown(Facet),
+    Unknown(Facet, bool),
+}
+
+impl BookingType {
+    fn bookable(&self) -> bool {
+        match self {
+            Self::Jira(_) => true,
+            Self::Unknown(_, bookable) => *bookable,
+        }
+    }
 }
 
 struct Booking {
     based_on_entries: Vec<u32>,
     duration: Duration,
+    suggested_duration: Option<Duration>,
+}
+
+impl Booking {
+    fn normalize(&mut self) -> i64 {
+        let duration = chrono::Duration::from_std(self.duration).unwrap();
+        let mut minutes = duration.num_minutes();
+        let diff_to_five = minutes.rem_euclid(5);
+        if diff_to_five != 0 {
+            minutes += 5 - diff_to_five;
+        }
+        let suggested_duration = chrono::Duration::minutes(minutes);
+
+        if suggested_duration < duration {}
+        let modify_time_seconds = duration.num_seconds() - suggested_duration.num_seconds();
+        let suggested_duration = suggested_duration.to_std().unwrap();
+        self.suggested_duration = Some(suggested_duration);
+        modify_time_seconds
+    }
+
+    fn modify(&mut self, modify_time_seconds: i64, incremental: bool) {
+        if !incremental {
+            self.suggested_duration = None;
+        }
+        if modify_time_seconds > 0 {
+            let modified_time = chrono::Duration::seconds(modify_time_seconds)
+                .to_std()
+                .unwrap();
+            self.suggested_duration = self
+                .suggested_duration
+                .unwrap_or(self.duration)
+                .checked_add(modified_time);
+        } else {
+            let modified_time = chrono::Duration::seconds(modify_time_seconds)
+                .abs()
+                .to_std()
+                .unwrap();
+            self.suggested_duration = self
+                .suggested_duration
+                .unwrap_or(self.duration)
+                .checked_sub(modified_time);
+        }
+    }
 }
 
 struct BookingDate {
     date: NaiveDate,
     total_duration: Duration,
+    actual_duration: Option<Duration>,
     jira_data: HashMap<String, booker::Fields>,
     suggested_bookings: BTreeMap<BookingType, Booking>,
+    booking_list: StatefulList<BookingType>,
+}
+
+impl BookingDate {
+    fn recalculate(&mut self) {
+        let mut modify_time_seconds = 0;
+        let _bookable_time: Duration = self
+            .suggested_bookings
+            .iter_mut()
+            .filter_map(|(bt, b)| match bt {
+                BookingType::Jira(_) | BookingType::Unknown(_, true) => {
+                    modify_time_seconds = modify_time_seconds + b.normalize();
+                    b.suggested_duration
+                }
+                _ => None,
+            })
+            .sum();
+        self.modify_unbookable_booking(modify_time_seconds, false);
+    }
+
+    fn modify_unbookable_booking(&mut self, modify_time_seconds: i64, incremental: bool) {
+        self.suggested_bookings
+            .iter_mut()
+            .find(|(bt, b)| {
+                if matches!(bt, BookingType::Unknown(_, false)) {
+                    if modify_time_seconds < 0 {
+                        b.suggested_duration.unwrap_or(b.duration)
+                            > chrono::Duration::seconds(modify_time_seconds)
+                                .abs()
+                                .to_std()
+                                .unwrap()
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            })
+            .map(|(_, booking)| booking.modify(modify_time_seconds, incremental));
+    }
+
+    fn modify_selected_entry(&mut self, modify_time_seconds: i64) {
+        if let Some(selected_entry) = self.booking_list.selected() {
+            if !selected_entry.bookable() {
+                return;
+            }
+            let booking = self
+                .suggested_bookings
+                .get_mut(selected_entry)
+                .expect("lost integrity");
+            if modify_time_seconds < 0
+                && booking.suggested_duration.unwrap_or(booking.duration)
+                    < chrono::Duration::seconds(modify_time_seconds)
+                        .abs()
+                        .to_std()
+                        .unwrap()
+            {
+                booking.suggested_duration = Some(chrono::Duration::seconds(0).to_std().unwrap());
+                return;
+            }
+            booking.modify(modify_time_seconds, true);
+            self.modify_unbookable_booking(-modify_time_seconds, true);
+        }
+    }
 }
 
 enum State {
@@ -375,7 +512,7 @@ impl State {
             }
             Self::Editing => String::from("[Esc] Finish editing"),
             Self::Paused => String::from("[p] Unpause"),
-            Self::Booking {..} => String::from("[Esc] Finish booking"),
+            Self::Booking {..} => String::from("[Up/Down] Move, [+/-] In/Decrease time, [Esc] Finish booking"),
         }
     }
 }
@@ -390,7 +527,7 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
         &config.jira_jql_issue_filter,
     )
     .await
-    .expect("query failed")
+    .expect("TODO: query failed")
     .into_iter()
     .map(|issue| (issue.key, issue.fields))
     .collect();
@@ -431,26 +568,32 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
                     .flatten()
                     .collect();
                 if issues.is_empty() {
-                    let found_entry: Option<String> = config
-                        .sides_jira_matching
-                        .get(&e.entry.facet)
-                        .map(|regex| {
-                            queried_issues.iter().find_map(|(id, fields)| {
-                                regex
-                                    .find(&fields.summary.to_lowercase())
-                                    .map(|_| id.clone())
+                    let additional_info = config.sides_additional_info.get(&e.entry.facet);
+                    let found_entry: Option<String> = additional_info
+                        .map(|info| {
+                            info.jira_summary_regex.as_ref().map(|regex| {
+                                queried_issues.iter().find_map(|(id, fields)| {
+                                    regex
+                                        .find(&fields.summary.to_lowercase())
+                                        .map(|_| id.clone())
+                                })
                             })
                         })
+                        .flatten()
                         .flatten();
                     let booking_type = match found_entry {
                         Some(id) => BookingType::Jira(id),
-                        None => BookingType::Unknown(e.entry.facet.clone()),
+                        None => BookingType::Unknown(
+                            e.entry.facet.clone(),
+                            additional_info.map_or(true, |i| i.bookable),
+                        ),
                     };
                     Some(vec![(
                         booking_type,
                         Booking {
                             based_on_entries: vec![e.entry.id],
                             duration: e.entry.duration,
+                            suggested_duration: None,
                         },
                     )])
                 } else {
@@ -467,6 +610,7 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
                                     Booking {
                                         based_on_entries: vec![e.entry.id],
                                         duration: e.entry.duration / n_issues,
+                                        suggested_duration: None,
                                     },
                                 )
                             })
@@ -506,11 +650,14 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
         .into_iter()
         .map(|issue| (issue.key, issue.fields)),
     );
+    let keys = accumulated_bookings.keys().cloned().collect();
     BookingDate {
         date: date.clone(),
         total_duration,
+        actual_duration: None,
         jira_data: queried_issues,
         suggested_bookings: accumulated_bookings,
+        booking_list: StatefulList::with_items(keys, None),
     }
 }
 
@@ -572,7 +719,7 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                 .borders(Borders::ALL)
                 .title("Additional information"),
         );
-        terminal.draw(|f| ui(f, &mut app, &textarea, &mut state, &config.timeflip))?;
+        terminal.draw(|f| ui(f, &mut app, &mut textarea, &mut state, &config.timeflip))?;
         let delay = Delay::new(Duration::from_millis(1_000));
         select! {
             event = stream.next() => {
@@ -685,9 +832,12 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                                         },
                                         _ => {}
                                     }
-                                    let text = if let Some(selected) = app.items.selected() {
+                                    let mut text = if let Some(selected) = app.items.selected() {
                                         app.entries.get(selected).expect("must be present").description.to_vec()
                                     } else { vec!["".to_string()] };
+                                    if matches!(state, State::Booking{..}) {
+                                      text = vec!["".to_string()];
+                                    }
                                     textarea = TextArea::new(text);
                                 }
                             }
@@ -717,22 +867,51 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                             }
                         },
                         State::Booking{ref mut date_selection_list, ref mut booking_date} => {
-                            if let Event::Key(key) = event {
-                                if key.kind == KeyEventKind::Press {
-                                    match key.code {
-                                        KeyCode::Esc => {
-                                            state = State::Selecting;
-                                            if let Some(editing_entry) = app.items.selected() {
-                                                let _entry = app.entries.get_mut(editing_entry).expect("must be present");
-                                            }
+                            match event.into() {
+                              Input { key: Key::Esc, .. } => {
+                                  state = State::Selecting;
+                                  if let Some(selected) = app.items.selected() {
+                                    textarea = TextArea::new(app.entries.get(selected).expect("must be present").description.to_vec());
+                                  }
+                              }
+                              input => {
+                                match booking_date {
+                                  Some(date) => {
+                                    match input {
+                                      Input { key: Key::Char('+'), .. } => {
+                                        date.modify_selected_entry(300);
+                                      },
+                                      Input { key: Key::Char('-'), .. } => {
+                                        date.modify_selected_entry(-300);
+                                      },
+                                      Input { key: Key::Down, .. } => {
+                                          date.booking_list.next();
+                                      },
+                                      Input { key: Key::Up, .. } => {
+                                        date.booking_list.previous();
+                                      }
+                                      input => {
+                                        textarea.input(input);
+                                        let parsed = chrono::NaiveTime::parse_from_str(&textarea.lines()[0], "%H:%M");
+                                        if let Ok(duration) = parsed {
+                                          let day = NaiveDate::from_ymd_opt(2023, 12, 24).unwrap();
+                                          let start = chrono::NaiveTime::from_hms_milli_opt(00, 00, 00, 0000).unwrap();
+                                          let delta: chrono::Duration = day.and_time(duration).signed_duration_since(day.and_time(start));
+                                          date.actual_duration = Some(delta.to_std().expect("negative not supported"));
                                         }
-                                        KeyCode::Down => {
+                                        date.recalculate();
+                                      }
+                                    }
+                                  },
+                                  None => {
+                                      match input {
+                                        Input { key: Key::Down, .. } => {
                                             date_selection_list.next();
                                         },
-                                        KeyCode::Up => {
+                                        Input { key: Key::Up, .. } => {
                                             date_selection_list.previous();
                                         }
-                                        KeyCode::Enter => {
+                                        Input { key: Key::Enter, .. } => {
                                             terminal.draw(|f| show_loading_window(f))?;
                                             if let Some(date) = date_selection_list.selected() {
                                                 let data = get_bookings_for_date(&app, &config, date).await;
@@ -740,8 +919,10 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                                             }
                                         }
                                         _ => {}
-                                    }
+                                      }
+                                  }
                                 }
+                              }
                             }
                         }
                     }
@@ -857,14 +1038,14 @@ fn show_booking_window<B: Backend>(
     f: &mut Frame<B>,
     buf: Rect,
     app: &mut App,
-    _textarea: &TextArea,
+    textarea: &mut TextArea,
     state: &mut State,
     config: &Config,
 ) {
     let inner_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -912,80 +1093,116 @@ fn show_booking_window<B: Backend>(
             f.render_stateful_widget(items, popup_layout[1], &mut date_selection_list.state);
         }
         Some(booking_date) => {
-            f.render_widget(
-                Paragraph::new(Line::from(format!(
-                    "Date: {}",
-                    booking_date.date.format("%d.%m.%Y")
-                ))),
-                inner_layout[0],
-            );
             let max_len = booking_date
                 .suggested_bookings
                 .iter()
                 .map(|(booking_type, _)| match booking_type {
                     BookingType::Jira(issue) => issue.len(),
-                    BookingType::Unknown(facet) => facet_name(&facet, config).len(),
+                    BookingType::Unknown(facet, _bookable) => facet_name(&facet, config).len() + 1,
                 })
                 .max()
                 .unwrap_or_default();
             let mut booked_time = Duration::new(0, 0);
-            let accumulated_text = booking_date
+            let mut total_shown_time = Duration::new(0, 0);
+            let accumulated_items: Vec<_> = booking_date
                 .suggested_bookings
                 .iter()
-                .map(|(booking_type, booking)| match booking_type {
-                    BookingType::Jira(issue) => {
-                        let additional_jira_data =
-                            if let Some(fields) = booking_date.jira_data.get(issue) {
-                                format!(" {}", fields.summary)
-                            } else {
-                                "".to_string()
-                            };
-                        booked_time += booking.duration;
-                        format!(
-                            "{:width$} {} {}\n",
-                            issue.to_string(),
-                            DurationView(&booking.duration),
-                            additional_jira_data,
-                            width = max_len
-                        )
-                    }
-                    BookingType::Unknown(facet) => {
-                        let additional_descriptions: Vec<_> = booking
-                            .based_on_entries
-                            .iter()
-                            .filter_map(|id| {
-                                let description = app
-                                    .entries
-                                    .get(id)
-                                    .expect("inconsistent data")
-                                    .description
-                                    .join("|");
-                                if !description.is_empty() {
-                                  Some(format!("<{}>", description))
+                .map(|(booking_type, booking)| {
+                    let text = match booking_type {
+                        BookingType::Jira(issue) => {
+                            let additional_jira_data =
+                                if let Some(fields) = booking_date.jira_data.get(issue) {
+                                    format!(" {}", fields.summary)
                                 } else {
-                                  None
-                                }
-                            })
-                            .collect();
-                        format!(
-                            "{:width$} {} ({})\n",
-                            facet_name(&facet, config),
-                            DurationView(&booking.duration),
-                            additional_descriptions.join(" "),
-                            width = max_len
-                        )
-                    }
+                                    "".to_string()
+                                };
+                            booked_time += booking.suggested_duration.unwrap_or(booking.duration);
+                            total_shown_time +=
+                                booking.suggested_duration.unwrap_or(booking.duration);
+                            format!(
+                                "{:width$} {} {}\n",
+                                issue.to_string(),
+                                DurationView(
+                                    &booking.suggested_duration.unwrap_or(booking.duration)
+                                ),
+                                additional_jira_data,
+                                width = max_len
+                            )
+                        }
+                        BookingType::Unknown(facet, bookable) => {
+                            let additional_descriptions: Vec<_> = booking
+                                .based_on_entries
+                                .iter()
+                                .filter_map(|id| {
+                                    let description = app
+                                        .entries
+                                        .get(id)
+                                        .expect("inconsistent data")
+                                        .description
+                                        .join("|");
+                                    if !description.is_empty() {
+                                        Some(format!("<{}>", description))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            let mut my_len = max_len;
+                            total_shown_time +=
+                                booking.suggested_duration.unwrap_or(booking.duration);
+                            format!(
+                                "{}{:width$} {} ({})\n",
+                                if *bookable {
+                                    ""
+                                } else {
+                                    my_len = my_len - 1;
+                                    "_"
+                                },
+                                facet_name(&facet, config),
+                                DurationView(
+                                    &booking.suggested_duration.unwrap_or(booking.duration)
+                                ),
+                                additional_descriptions.join(" "),
+                                width = my_len
+                            )
+                        }
+                    };
+                    let line = Line::from(text);
+                    ListItem::new(line).style(Style::default().fg(Color::White).bg(Color::Black))
                 })
-                .collect::<String>();
+                .collect();
+            let accumulated_items = List::new(accumulated_items).highlight_symbol(">> ");
             f.render_widget(
                 Paragraph::new(format!(
-                    "Total duration: {} ({} booked)",
+                    "Date: {}\nTotal duration: {} (=={}==) ({} booked){}",
+                    booking_date.date.format("%d.%m.%Y"),
                     DurationView(&booking_date.total_duration),
-                    DurationView(&booked_time)
+                    DurationView(&total_shown_time),
+                    DurationView(&booked_time),
+                    booking_date
+                        .actual_duration
+                        .map_or("".to_string(), |d| format!(
+                            " Actual time: {}",
+                            DurationView(&d)
+                        ))
                 )),
-                inner_layout[1],
+                inner_layout[0],
             );
-            f.render_widget(Paragraph::new(accumulated_text), inner_layout[3]);
+            textarea.set_block(Block::default().borders(Borders::NONE));
+            let text_area = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(19), Constraint::Length(5)])
+                .split(inner_layout[1]);
+            f.render_widget(
+                Paragraph::new(format!("Time-tracker time: ",)),
+                text_area[0],
+            );
+            f.render_widget(textarea.widget(), text_area[1]);
+            f.render_stateful_widget(
+                accumulated_items,
+                inner_layout[3],
+                &mut booking_date.booking_list.state,
+            );
         }
     }
 }
@@ -993,7 +1210,7 @@ fn show_booking_window<B: Backend>(
 fn ui<B: Backend>(
     f: &mut Frame<B>,
     app: &mut App,
-    textarea: &TextArea,
+    textarea: &mut TextArea,
     state: &mut State,
     config: &Config,
 ) {
