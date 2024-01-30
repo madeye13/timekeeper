@@ -375,7 +375,7 @@ impl BookingType {
 }
 
 struct Booking {
-    based_on_entries: Vec<u32>,
+    based_on_entries: Vec<(u32, u32)>,
     duration: Duration,
     suggested_duration: Option<Duration>,
 }
@@ -432,7 +432,7 @@ struct BookingDate {
 }
 
 impl BookingDate {
-    fn recalculate(&mut self) {
+    fn normalize_times(&mut self) {
         let mut modify_time_seconds = 0;
         let _bookable_time: Duration = self
             .suggested_bookings
@@ -501,19 +501,20 @@ enum State {
     Booking {
         date_selection_list: StatefulList<NaiveDate>,
         booking_date: Option<BookingDate>,
+        extended_info: bool,
     },
 }
 
 impl State {
     fn get_description(&self) -> String {
         match self {
-            Self::Selecting => {
-                String::from("[Up/Down] Move, [->] Edit, [p] Pause, [d] Done, [t] Toggle Visibility, [s] Sync, [q] Quit")
-            }
-            Self::Editing => String::from("[Esc] Finish editing"),
-            Self::Paused => String::from("[p] Unpause"),
-            Self::Booking {..} => String::from("[Up/Down] Move, [+/-] In/Decrease time, [Esc] Finish booking"),
-        }
+    Self::Selecting => {
+      String::from("[Up/Down] Move, [->] Edit, [p] Pause, [d] Done, [t] Toggle Visibility, [s] Sync, [q] Quit")
+    }
+    Self::Editing => String::from("[Esc] Finish editing"),
+    Self::Paused => String::from("[p] Unpause"),
+    Self::Booking {..}=> String::from("[Up/Down] Move, [+/-] In/Decrease time, [e] Toggle Information, [Esc] Finish booking"),
+  }
     }
 }
 
@@ -591,7 +592,7 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
                     Some(vec![(
                         booking_type,
                         Booking {
-                            based_on_entries: vec![e.entry.id],
+                            based_on_entries: vec![(e.entry.id, 100)],
                             duration: e.entry.duration,
                             suggested_duration: None,
                         },
@@ -608,7 +609,7 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
                                 (
                                     BookingType::Jira(issue.clone()),
                                     Booking {
-                                        based_on_entries: vec![e.entry.id],
+                                        based_on_entries: vec![(e.entry.id, 100 / n_issues)],
                                         duration: e.entry.duration / n_issues,
                                         suggested_duration: None,
                                     },
@@ -722,212 +723,217 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
         terminal.draw(|f| ui(f, &mut app, &mut textarea, &mut state, &config.timeflip))?;
         let delay = Delay::new(Duration::from_millis(1_000));
         select! {
-            event = stream.next() => {
-                match event {
-                    Some(TimeEvent::DoubleTap { pause, .. }) => {
-                        match state {
-                            State::Paused => {
-                                if !pause {
-                                    state = State::Selecting;
-                                }
-                            }
-                            _ => {
-                                if pause {
-                                    state = State::Paused;
-                                }
-                            }
+          event = stream.next() => {
+            match event {
+              Some(TimeEvent::DoubleTap {pause, ..}) => {
+                match state {
+                  State::Paused => {
+                    if !pause {
+                      state = State::Selecting;
+                    }
+                  }
+                  _ => {
+                    if pause {
+                      state = State::Paused;
+                    }
+                  }
+                }
+              },
+              Some(TimeEvent::Facet(_facet)) => {
+                if matches!(state, State::Paused) {
+                  state = State::Selecting;
+                }
+              }
+              Some(_) => continue,
+              None => continue,
+            }
+          }
+          _ = delay => {continue;}
+          res = &mut bg_task => {
+            if let Err(e) =res {
+              bail!("bluetooth session background task exited with error: {e}");
+            }
+          }
+          maybe_event = reader.next() => {
+            if let Some(Ok(event)) = maybe_event {
+              match state {
+                State::Selecting => {
+                  if let Event::Key(key) = event {
+                    if key.kind == KeyEventKind::Press {
+                      match key.code {
+                        KeyCode::Char('q') => {
+                          let entries: Vec<MyEntry> = app.entries.into_values().collect();
+                          persist_history(&opt.persistent_file, &entries).await?;
+                          return Ok(())
+                        },
+                        KeyCode::Char('p') => {
+                          timeflip.pause().await?;
+                          state = State::Paused;
                         }
+                        KeyCode::Char('d') => {
+                          if let Some(selected) = app.items.selected() {
+                            let entry = app.entries.get_mut(selected).expect("must be present");
+                            entry.visible = !entry.visible;
+                            if !entry.visible && !app.show_invisible {
+                              app.items.remove();
+                            }
+                          }
+                        }
+                        KeyCode::Delete => {
+                          if let Some(selected) = app.items.selected() {
+                            let entry = app.entries.get_mut(selected).expect("must be present");
+                            if !entry.visible && app.show_invisible {
+                              app.items.remove();
+                              entry.deleted = true;
+                            }
+                          }
+                        }
+                        KeyCode::Char('b') => {
+                          let date_selection_list = StatefulList::with_items(app.get_available_dates(), None);
+                          state = State::Booking {date_selection_list, booking_date: None, extended_info: false};
+                        }
+                        KeyCode::Char('t') => {
+                          app.toggle_visibility();
+                        }
+                        KeyCode::Char('s') => {
+                          let update: Vec<Entry> = timeflip
+                          .read_history_since(last_seen)
+                          .await?
+                          .into_iter()
+                          .collect();
+                          for entry in update {
+                            last_seen = max(entry.id, last_seen);
+                            match app.entries.entry(entry.id) {
+                              Vacant(v) => {
+                                v.insert(MyEntry {
+                                      entry,
+                                      description: vec![],
+                                      visible: true,
+                                      deleted: false,
+                                    });
+                              }
+                              Occupied(mut o) => {
+                                o.get_mut().entry = entry;
+                              }
+                            }
+                          }
+                          app.update_entry_list();
+                        }
+                        KeyCode::Right => {
+                          if app.items.selected().is_some() {
+                            state = State::Editing;
+                            textarea.set_style(Style::default().fg(Color::White));
+                          }
+                        }
+                        KeyCode::Down => {
+                          app.items.next();
+                        },
+                        KeyCode::Up => {
+                          app.items.previous();
+                        },
+                        _ => {}
+                      }
+                      let mut text = if let Some(selected) = app.items.selected() {
+                        app.entries.get(selected).expect("must be present").description.to_vec()
+                      } else {vec!["".to_string()]};
+                      if matches!(state, State::Booking {..}) {
+                        text = vec!["".to_string()];
+                      }
+                      textarea = TextArea::new(text);
+                    }
+                  }
+                },
+                State::Editing => {
+                  match event.into() {
+                    Input {key: Key::Esc, ..}=> {
+                      state = State::Selecting;
+                      if let Some(editing_entry) = app.items.selected() {
+                        let entry = app.entries.get_mut(editing_entry).expect("must be present");
+                        entry.description = textarea.lines().to_vec();
+                      }
+                      textarea.set_style(Style::default().fg(Color::Gray));
                     },
-                    Some(TimeEvent::Facet(_facet)) => {
-                        if matches!(state, State::Paused) {
-                            state = State::Selecting;
-                        }
+                    input => {
+                      textarea.input(input);
                     }
-                    Some(_) => continue,
-                    None => continue,
+                  }
                 }
-            }
-            _ = delay => { continue; }
-            res = &mut bg_task => {
-                if let Err(e) =res {
-                    bail!("bluetooth session background task exited with error: {e}");
-                }
-            }
-            maybe_event = reader.next() => {
-                if let Some(Ok(event)) = maybe_event {
-                    match state {
-                        State::Selecting => {
-                            if let Event::Key(key) = event {
-                                if key.kind == KeyEventKind::Press {
-                                    match key.code {
-                                        KeyCode::Char('q') => {
-                                            let entries: Vec<MyEntry> = app.entries.into_values().collect();
-                                            persist_history(&opt.persistent_file, &entries).await?;
-                                            return Ok(())
-                                        },
-                                        KeyCode::Char('p') => {
-                                            timeflip.pause().await?;
-                                            state = State::Paused;
-                                        }
-                                        KeyCode::Char('d') => {
-                                            if let Some(selected) = app.items.selected() {
-                                                let entry = app.entries.get_mut(selected).expect("must be present");
-                                                entry.visible = !entry.visible;
-                                                if !entry.visible && !app.show_invisible {
-                                                    app.items.remove();
-                                                }
-                                            }
-                                        }
-                                        KeyCode::Delete => {
-                                            if let Some(selected) = app.items.selected() {
-                                                let entry = app.entries.get_mut(selected).expect("must be present");
-                                                if !entry.visible && app.show_invisible {
-                                                    app.items.remove();
-                                                    entry.deleted = true;
-                                                }
-                                            }
-                                        }
-                                        KeyCode::Char('b') => {
-                                            let date_selection_list = StatefulList::with_items(app.get_available_dates(), None);
-                                            state = State::Booking { date_selection_list, booking_date: None};
-                                        }
-                                        KeyCode::Char('t') => {
-                                            app.toggle_visibility();
-                                        }
-                                        KeyCode::Char('s') => {
-                                            let update: Vec<Entry> = timeflip
-                                                .read_history_since(last_seen)
-                                                .await?
-                                                .into_iter()
-                                                .collect();
-                                            for entry in update {
-                                                last_seen = max(entry.id, last_seen);
-                                                match app.entries.entry(entry.id) {
-                                                    Vacant(v) => {
-                                                        v.insert(MyEntry {
-                                                            entry,
-                                                            description: vec![],
-                                                            visible: true,
-                                                            deleted: false,
-                                                        });
-                                                    }
-                                                    Occupied(mut o) => {
-                                                        o.get_mut().entry = entry;
-                                                    }
-                                                }
-                                            }
-                                            app.update_entry_list();
-                                        }
-                                        KeyCode::Right => {
-                                            if app.items.selected().is_some() {
-                                                state = State::Editing;
-                                                textarea.set_style(Style::default().fg(Color::White));
-                                            }
-                                        }
-                                        KeyCode::Down => {
-                                            app.items.next();
-                                        },
-                                        KeyCode::Up => {
-                                            app.items.previous();
-                                        },
-                                        _ => {}
-                                    }
-                                    let mut text = if let Some(selected) = app.items.selected() {
-                                        app.entries.get(selected).expect("must be present").description.to_vec()
-                                    } else { vec!["".to_string()] };
-                                    if matches!(state, State::Booking{..}) {
-                                      text = vec!["".to_string()];
-                                    }
-                                    textarea = TextArea::new(text);
-                                }
+                State::Paused => {
+                  match event.into() {
+                    Input {key: Key::Char('p'), ..}=> {
+                      let now = Local::now();
+                      timeflip.set_time(now.into()).await?;
+                      timeflip.unpause().await?;
+                      state = State::Selecting;
+                    }
+                    _ => {},
+                  }
+                },
+                State::Booking {ref mut date_selection_list, ref mut booking_date, ref mut extended_info} => {
+                  match event.into() {
+                    Input {key: Key::Esc, ..}=> {
+                      state = State::Selecting;
+                      if let Some(selected) = app.items.selected() {
+                        textarea = TextArea::new(app.entries.get(selected).expect("must be present").description.to_vec());
+                      }
+                    }
+                    input => {
+                      match booking_date {
+                        Some(date) => {
+                          match input {
+                            Input {key: Key::Char('+'), ..}=> {
+                              date.modify_selected_entry(300);
+                            },
+                            Input {key: Key::Char('-'), ..}=> {
+                              date.modify_selected_entry(-300);
+                            },
+                            Input {key: Key::Down, ..}=> {
+                              date.booking_list.next();
+                            },
+                            Input {key: Key::Up, ..}=> {
+                              date.booking_list.previous();
                             }
-                        },
-                        State::Editing => {
-                            match event.into() {
-                                Input { key: Key::Esc, .. } => {
-                                    state = State::Selecting;
-                                    if let Some(editing_entry) = app.items.selected() {
-                                        let entry = app.entries.get_mut(editing_entry).expect("must be present");
-                                        entry.description = textarea.lines().to_vec();
-                                    }
-                                    textarea.set_style(Style::default().fg(Color::Gray));
-                                },
-                                input => {
-                                    textarea.input(input);
-                                }
-                            }
-                        }
-                        State::Paused => {
-                            match event.into() {
-                                    Input { key: Key::Char('p'), .. } => {
-                                        timeflip.unpause().await?;
-                                        state = State::Selecting;
-                                    }
-                                    _ => {},
-                            }
-                        },
-                        State::Booking{ref mut date_selection_list, ref mut booking_date} => {
-                            match event.into() {
-                              Input { key: Key::Esc, .. } => {
-                                  state = State::Selecting;
-                                  if let Some(selected) = app.items.selected() {
-                                    textarea = TextArea::new(app.entries.get(selected).expect("must be present").description.to_vec());
-                                  }
-                              }
-                              input => {
-                                match booking_date {
-                                  Some(date) => {
-                                    match input {
-                                      Input { key: Key::Char('+'), .. } => {
-                                        date.modify_selected_entry(300);
-                                      },
-                                      Input { key: Key::Char('-'), .. } => {
-                                        date.modify_selected_entry(-300);
-                                      },
-                                      Input { key: Key::Down, .. } => {
-                                          date.booking_list.next();
-                                      },
-                                      Input { key: Key::Up, .. } => {
-                                        date.booking_list.previous();
-                                      }
-                                      input => {
-                                        textarea.input(input);
-                                        let parsed = chrono::NaiveTime::parse_from_str(&textarea.lines()[0], "%H:%M");
-                                        if let Ok(duration) = parsed {
-                                          let day = NaiveDate::from_ymd_opt(2023, 12, 24).unwrap();
-                                          let start = chrono::NaiveTime::from_hms_milli_opt(00, 00, 00, 0000).unwrap();
-                                          let delta: chrono::Duration = day.and_time(duration).signed_duration_since(day.and_time(start));
-                                          date.actual_duration = Some(delta.to_std().expect("negative not supported"));
-                                        }
-                                        date.recalculate();
-                                      }
-                                    }
-                                  },
-                                  None => {
-                                      match input {
-                                        Input { key: Key::Down, .. } => {
-                                            date_selection_list.next();
-                                        },
-                                        Input { key: Key::Up, .. } => {
-                                            date_selection_list.previous();
-                                        }
-                                        Input { key: Key::Enter, .. } => {
-                                            terminal.draw(|f| show_loading_window(f))?;
-                                            if let Some(date) = date_selection_list.selected() {
-                                                let data = get_bookings_for_date(&app, &config, date).await;
-                                                *booking_date = Some(data);
-                                            }
-                                        }
-                                        _ => {}
-                                      }
-                                  }
-                                }
+                            Input {key: Key::Char('e'), ..}=> {
+                              *extended_info = !*extended_info;
+                            },
+                            input => {
+                              textarea.input(input);
+                              let parsed = chrono::NaiveTime::parse_from_str(&textarea.lines()[0], "%H:%M");
+                              if let Ok(duration) = parsed {
+                                let day = NaiveDate::from_ymd_opt(2023, 12, 24).unwrap();
+                                let start = chrono::NaiveTime::from_hms_milli_opt(00, 00, 00, 0000).unwrap();
+                                let delta: chrono::Duration = day.and_time(duration).signed_duration_since(day.and_time(start));
+                                date.actual_duration = Some(delta.to_std().expect("negative not supported"));
                               }
                             }
+                          }
+                        },
+                        None => {
+                          match input {
+                            Input {key: Key::Down, ..}=> {
+                              date_selection_list.next();
+                            },
+                            Input {key: Key::Up, ..}=> {
+                              date_selection_list.previous();
+                            }
+                            Input {key: Key::Enter, ..}=> {
+                              terminal.draw(|f| show_loading_window(f))?;
+                              if let Some(date) = date_selection_list.selected() {
+                                let mut data = get_bookings_for_date(&app, &config, date).await;
+                                data.normalize_times();
+                                *booking_date = Some(data);
+                              }
+                            }
+                            _ => {}
+                          }
                         }
+                      }
                     }
+                  }
                 }
+              }
             }
+          }
         };
     }
 }
@@ -1052,12 +1058,13 @@ fn show_booking_window<B: Backend>(
         ])
         .split(buf);
 
-    let (booking_date, date_selection_list) = if let State::Booking {
+    let (booking_date, date_selection_list, extended_info) = if let State::Booking {
         date_selection_list,
         booking_date,
+        extended_info,
     } = state
     {
-        (booking_date, date_selection_list)
+        (booking_date, date_selection_list, extended_info)
     } else {
         unreachable!("only booking state here")
     };
@@ -1119,21 +1126,49 @@ fn show_booking_window<B: Backend>(
                             booked_time += booking.suggested_duration.unwrap_or(booking.duration);
                             total_shown_time +=
                                 booking.suggested_duration.unwrap_or(booking.duration);
-                            format!(
-                                "{:width$} {} {}\n",
+                            let mut text = Text::from(format!(
+                                "{:width$} {} {}",
                                 issue.to_string(),
                                 DurationView(
                                     &booking.suggested_duration.unwrap_or(booking.duration)
                                 ),
                                 additional_jira_data,
-                                width = max_len
-                            )
+                                width = max_len,
+                            ));
+                            if *extended_info {
+                                let local = Local::now().timezone();
+                                let based_on_work_entries: Vec<String> = booking
+                                    .based_on_entries
+                                    .iter()
+                                    .map(|(id, percentage)| {
+                                        let entry = app.entries.get(id).expect("inconsistent data");
+                                        let end_time = entry.entry.time
+                                            + chrono::Duration::from_std(entry.entry.duration)
+                                                .expect("should work");
+                                        let duration = entry.entry.duration * *percentage / 100;
+                                        format!(
+                                            "{:>width$}-{} ({}% = {}): {}",
+                                            entry.entry.time.with_timezone(&local).format("%H:%M"),
+                                            end_time.with_timezone(&local).format("%H:%M"),
+                                            percentage,
+                                            DurationView(&duration),
+                                            entry.description.join(" "),
+                                            width = max_len + 20
+                                        )
+                                    })
+                                    .collect();
+                                text.extend(Text::styled(
+                                    based_on_work_entries.join("\n"),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                            text
                         }
                         BookingType::Unknown(facet, bookable) => {
                             let additional_descriptions: Vec<_> = booking
                                 .based_on_entries
                                 .iter()
-                                .filter_map(|id| {
+                                .filter_map(|(id, _percentage)| {
                                     let description = app
                                         .entries
                                         .get(id)
@@ -1150,7 +1185,7 @@ fn show_booking_window<B: Backend>(
                             let mut my_len = max_len;
                             total_shown_time +=
                                 booking.suggested_duration.unwrap_or(booking.duration);
-                            format!(
+                            Text::from(format!(
                                 "{}{:width$} {} ({})\n",
                                 if *bookable {
                                     ""
@@ -1164,10 +1199,10 @@ fn show_booking_window<B: Backend>(
                                 ),
                                 additional_descriptions.join(" "),
                                 width = my_len
-                            )
+                            ))
                         }
                     };
-                    let line = Line::from(text);
+                    let line = Text::from(text);
                     ListItem::new(line).style(Style::default().fg(Color::White).bg(Color::Black))
                 })
                 .collect();
