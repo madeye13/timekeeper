@@ -332,6 +332,7 @@ struct MyConfig {
     jira_base_url: String,
     jira_board_id: String,
     jira_jql_issue_filter: String,
+    booker_issue_regex: String,
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_sides_additional_info")]
     sides_additional_info: HashMap<Facet, SideAdditionalInfo>,
@@ -548,10 +549,10 @@ async fn get_bookings_for_date(app: &App, config: &MyConfig, date: &NaiveDate) -
                     == date
             {
                 total_duration += e.entry.duration;
-                let re = RegexBuilder::new(r"CPS\-[0-9]+|IN\-[0-9]+|SYFU\-[0-9]+|SYMX\-[0-9]+")
+                let re = RegexBuilder::new(&config.booker_issue_regex)
                     .case_insensitive(true)
                     .build()
-                    .unwrap();
+                    .expect("TODO: return regex result here");
                 let issues: Vec<String> = e
                     .description
                     .iter()
