@@ -770,6 +770,8 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                         KeyCode::Char('p') => {
                           timeflip.pause().await?;
                           state = State::Paused;
+                          let entries: Vec<MyEntry> = app.entries.clone().into_values().collect();
+                          persist_history(&opt.persistent_file, &entries).await?;
                         }
                         KeyCode::Char('d') => {
                           if let Some(selected) = app.items.selected() {
@@ -797,6 +799,8 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                           app.toggle_visibility();
                         }
                         KeyCode::Char('s') => {
+                          let entries: Vec<MyEntry> = app.entries.clone().into_values().collect();
+                          persist_history(&opt.persistent_file, &entries).await?;
                           let update: Vec<Entry> = timeflip
                           .read_history_since(last_seen)
                           .await?
