@@ -19,6 +19,7 @@ tokio = { version = "1.28.2", features = ["fs" ,"macros", "rt-multi-thread", "si
 tui-textarea = { version = "0.2.4", default-features = false, features = ["ratatui-crossterm"] }
 regex = "1.10.2"
 reqwest = { version = "0.11", features = ["json"] }
+libxdo-sys = "0.11.0"
 
 timeflippers = { git = "https://github.com/madeye13/timeflippers" }
 

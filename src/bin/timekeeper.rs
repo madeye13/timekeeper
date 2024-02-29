@@ -36,7 +36,7 @@ use timeflippers::{
 use tokio::{fs, select};
 use tui_textarea::{Input, Key, TextArea};
 
-use timekeeper::booker;
+use timekeeper::{booker, xdo};
 
 struct DurationView<'a>(&'a Duration);
 
@@ -703,6 +703,11 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
     }
     app.update_entry_list();
 
+    let xdo = xdo::XDoHandle::new()?;
+    xdo.require_user_attention(0)
+        .expect("can't require user attention");
+    xdo.require_user_attention(0)
+        .expect("can't require user attention");
     let mut textarea = if let Some(selected) = &app.items.selected() {
         let text = app
             .entries
@@ -737,11 +742,15 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                 match state {
                   State::Paused => {
                     if !pause {
+                      xdo.require_user_attention(0).expect("can't require user attention");
+                      xdo.require_user_attention(0).expect("can't require user attention");
                       state = State::Selecting;
                     }
                   }
                   _ => {
                     if pause {
+                      xdo.require_user_attention(1).expect("can't require user attention");
+                      xdo.require_user_attention(1).expect("can't require user attention");
                       state = State::Paused;
                     }
                   }
@@ -749,6 +758,8 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
               },
               Some(TimeEvent::Facet(_facet)) => {
                 if matches!(state, State::Paused) {
+                  xdo.require_user_attention(0).expect("can't require user attention");
+                  xdo.require_user_attention(0).expect("can't require user attention");
                   state = State::Selecting;
                 }
               }
@@ -770,11 +781,15 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                     if key.kind == KeyEventKind::Press {
                       match key.code {
                         KeyCode::Char('q') => {
+                          xdo.require_user_attention(0).expect("can't require user attention");
+                          xdo.require_user_attention(0).expect("can't require user attention");
                           let entries: Vec<MyEntry> = app.entries.into_values().collect();
                           persist_history(&opt.persistent_file, &entries).await?;
                           return Ok(())
                         },
                         KeyCode::Char('p') => {
+                          xdo.require_user_attention(1).expect("can't require user attention");
+                          xdo.require_user_attention(1).expect("can't require user attention");
                           timeflip.pause().await?;
                           state = State::Paused;
                           let entries: Vec<MyEntry> = app.entries.clone().into_values().collect();
@@ -873,6 +888,8 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                 State::Paused => {
                   match event.into() {
                     Input {key: Key::Char('p'), ..}=> {
+                      xdo.require_user_attention(0).expect("can't require user attention");
+                      xdo.require_user_attention(0).expect("can't require user attention");
                       let now = Local::now();
                       timeflip.set_time(now.into()).await?;
                       timeflip.unpause().await?;
