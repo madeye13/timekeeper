@@ -2,7 +2,8 @@ use anyhow::bail;
 use chrono::{offset::TimeZone, DateTime, NaiveDate, NaiveTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,19 +52,19 @@ struct Sprint {
     name: String,
 }
 
-async fn post_request(
+async fn post_request<T: Serialize + ?Sized>(
     url: &str,
     path: &str,
     user: &str,
     token: &str,
-    json_map: &[(&str, &str)],
+    json: &T,
 ) -> anyhow::Result<(u16, Value)> {
     let url = format!("{}/rest/api/latest{}", url, path);
     let client = Client::new();
     let res = client
         .post(url)
         .basic_auth(user, Some(token))
-        .json(&json_map)
+        .json(json)
         .send()
         .await?;
     let status = res.status().as_u16();
@@ -200,4 +201,24 @@ pub async fn get_issues(
         }
     }
     queried_issues
+}
+
+pub async fn book_time(
+    base_url: &str,
+    jira_user: &str,
+    jira_token: &str,
+    issue: String,
+    date: NaiveDate,
+    time_spent: Duration,
+) -> anyhow::Result<()> {
+    post_request(
+            base_url,
+            &format!("/issue/{}/worklog", issue),
+            &jira_user,
+            &jira_token,
+            &json!({"started": format!("{}", date.and_hms_opt(9,0,0).expect("valid time").and_utc().format("%FT%T%.3f%z")),
+                    "timeSpentSeconds": time_spent.as_secs()}),
+        )
+        .await?;
+    Ok(())
 }

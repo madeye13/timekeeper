@@ -500,6 +500,19 @@ impl BookingDate {
             self.modify_unbookable_booking(-modify_time_seconds, true);
         }
     }
+
+    async fn prepare_jira_booking(&mut self) -> Vec<(String, Duration)> {
+        self.suggested_bookings
+            .iter_mut()
+            .filter_map(|(bt, booking)| match bt {
+                BookingType::Unknown(_, _) => None,
+                BookingType::Jira(issue) => Some((
+                    issue.to_string(),
+                    booking.suggested_duration.unwrap_or(booking.duration),
+                )),
+            })
+            .collect()
+    }
 }
 
 enum State {
@@ -510,6 +523,7 @@ enum State {
         date_selection_list: StatefulList<NaiveDate>,
         booking_date: Option<BookingDate>,
         extended_info: bool,
+        jira_booker: u32,
     },
 }
 
@@ -815,7 +829,7 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                         }
                         KeyCode::Char('b') => {
                           let date_selection_list = StatefulList::with_items(app.get_available_dates(), None);
-                          state = State::Booking {date_selection_list, booking_date: None, extended_info: false};
+                          state = State::Booking {date_selection_list, booking_date: None, extended_info: false, jira_booker: 0};
                         }
                         KeyCode::Char('t') => {
                           app.toggle_visibility();
@@ -898,7 +912,7 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                     _ => {},
                   }
                 },
-                State::Booking {ref mut date_selection_list, ref mut booking_date, ref mut extended_info} => {
+                State::Booking {ref mut date_selection_list, ref mut booking_date, ref mut extended_info, ref mut jira_booker} => {
                   match event.into() {
                     Input {key: Key::Esc, ..}=> {
                       state = State::Selecting;
@@ -924,6 +938,57 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                             }
                             Input {key: Key::Char('e'), ..}=> {
                               *extended_info = !*extended_info;
+                            },
+                            Input {key: Key::Char('b'), ..}=> {
+                              *jira_booker = *jira_booker + 1;
+                              let booking_data = date.prepare_jira_booking().await;
+                              let show = |terminal: &mut Terminal<_>, title: String, data: &[(String, Duration)]| {
+                                terminal.draw(|f| {
+                                  let area = centered_rect(60, 25, f.size());
+                                  let popup_block = Block::default()
+                                      .title(title)
+                                      .borders(Borders::NONE)
+                                      .style(Style::default().bg(Color::DarkGray));
+                                  let popup_layout = Layout::default()
+                                      .direction(Direction::Vertical)
+                                      .constraints([Constraint::Length(1), Constraint::Length(data.len().try_into().unwrap())])
+                                      .split(area);
+                                  f.render_widget(popup_block, popup_layout[0]);
+                                  f.render_widget(
+                                      Paragraph::new(Text::from(data.iter().map(|(issue, d)| { format!("{}: {}\n", issue, DurationView(&d))}).collect::<String>()
+                                                      )),
+                                                  popup_layout[1],
+                                              );
+                                });
+                              };
+                              if *jira_booker <= 3 {
+                                show(terminal, format!("Really book that? Question {}/3", *jira_booker), &booking_data);
+                                Delay::new(Duration::from_millis(2_000)).await;
+                              } else {
+                                let mut err = 0;
+                                let list = booking_data.clone();
+                                let mut prefix: HashMap<String, String> = HashMap::new();
+                                for (issue, duration) in booking_data {
+                                  match booker::book_time(
+                                             &config.jira_base_url,
+                                             &config.jira_user,
+                                             &config.jira_token,
+                                             issue.clone(),
+                                             date.date,
+                                             duration.clone(),
+                                         )
+                                         .await {
+                                    Ok(_) => { prefix.insert(issue, "OK".to_string());},
+                                    Err(e) => {
+                                      err = err + 1;
+                                      prefix.insert(issue, format!("[ERR({})]", e));
+                                    }
+                                  };
+                                  show(terminal, "Booking...".to_string(), &list.iter().map(|(issue, duration)| (format!("[{}] {}", prefix.get(issue).unwrap_or(&" ".to_string()), issue), duration.clone())).collect::<Vec<(String, Duration)>>());
+                                }
+                                show(terminal, format!("{}", if err > 0 { format!("Not okay, {} failed", err) } else { "Okay all booked!".to_string() }), &list.iter().map(|(issue, duration)| (format!("[{}] {}", prefix.get(issue).unwrap_or(&" ".to_string()), issue), duration.clone())).collect::<Vec<(String, Duration)>>());
+                                Delay::new(Duration::from_millis(5_000)).await;
+                              }
                             },
                             input => {
                               textarea.input(input);
@@ -1091,6 +1156,7 @@ fn show_booking_window<B: Backend>(
         date_selection_list,
         booking_date,
         extended_info,
+        jira_booker: _,
     } = state
     {
         (booking_date, date_selection_list, extended_info)
