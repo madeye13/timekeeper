@@ -1,4 +1,3 @@
-use crossterm_027 as crossterm;
 use std::{
     cmp::max,
     error::Error,
@@ -10,18 +9,19 @@ use std::{
 use anyhow::bail;
 use chrono::{Local, NaiveDate};
 use clap::Parser;
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind},
+use crossterm::event::EventStream;
+use futures::{FutureExt, StreamExt};
+use futures_timer::Delay;
+use ratatui::crossterm::{
+    event::{Event, KeyCode, KeyEvent, KeyEventKind},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
     },
 };
-use futures::StreamExt;
-use futures_timer::Delay;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
 };
 use regex::{Regex, RegexBuilder};
 use serde::{de, Deserialize, Serialize};
@@ -34,7 +34,7 @@ use timeflippers::{
     BluetoothSession, Config, Facet, TimeFlip,
 };
 use tokio::{fs, select};
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::TextArea;
 
 use timekeeper::{booker, xdo};
 
@@ -204,6 +204,15 @@ impl App {
     }
 }
 
+fn set_panic_hook() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        hook(panic_info);
+    }));
+}
+
 #[derive(Parser)]
 #[clap(about)]
 struct Options {
@@ -216,25 +225,19 @@ struct Options {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let opt = Options::parse();
+
+    color_eyre::install().expect("could not install color_eyre");
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        SetTitle("Timekeeper")
-    )?;
+    execute!(stdout, EnterAlternateScreen, SetTitle("Timekeeper"))?;
+    set_panic_hook();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run(&mut terminal, opt).await;
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen,)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
@@ -523,7 +526,6 @@ enum State {
         date_selection_list: StatefulList<NaiveDate>,
         booking_date: Option<BookingDate>,
         extended_info: bool,
-        jira_booker: u32,
     },
 }
 
@@ -531,11 +533,16 @@ impl State {
     fn get_description(&self) -> String {
         match self {
     Self::Selecting => {
-      String::from("[Up/Down] Move, [->] Edit, [p] Pause, [d] Done, [t] Toggle Visibility, [s] Sync, [q] Quit")
+      String::from("[↑/↓] Move, [→] Edit, [p] Pause, [d] Done, [t] Toggle Visibility, [s] Sync, [q] Quit")
     }
     Self::Editing => String::from("[Esc] Finish editing"),
     Self::Paused => String::from("[p] Unpause"),
-    Self::Booking {..}=> String::from("[Up/Down] Move, [+/-] In/Decrease time, [e] Toggle Information, [Esc] Finish booking"),
+    Self::Booking {booking_date, ..} => {
+      match booking_date.is_some() {
+        true => String::from("[↑/↓] Move, [+/-] In/Decrease time, [e] Toggle Information, [b] Book in Jira, [Esc] Finish booking"),
+        false => String::from("[↑/↓] Move, [↵] Select, [Esc] Finish booking"),
+      }
+    }
   }
     }
 }
@@ -735,11 +742,12 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
     };
 
     let mut state = State::Selecting;
-    let mut reader = EventStream::new();
+    let mut reader = Some(EventStream::new());
 
     timeflip.subscribe_double_tap().await?;
     timeflip.subscribe_facet().await?;
     let mut stream = timeflip.event_stream().await?;
+    let mut repetition_count = 0;
 
     loop {
         textarea.set_block(
@@ -747,7 +755,17 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                 .borders(Borders::ALL)
                 .title("Additional information"),
         );
-        terminal.draw(|f| ui(f, &mut app, &mut textarea, &mut state, &config.timeflip))?;
+
+        terminal.draw(|f| {
+            ui(
+                f,
+                &mut app,
+                &mut textarea,
+                &mut state,
+                &config.timeflip,
+                repetition_count,
+            )
+        })?;
         let delay = Delay::new(Duration::from_millis(1_000));
         select! {
           event = stream.next() => {
@@ -781,17 +799,22 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
               None => continue,
             }
           }
-          _ = delay => {continue;}
+          _ = delay => {
+            repetition_count = 0;
+            if reader.is_none() {
+              reader = Some(EventStream::new());
+            }
+            continue;
+          }
           res = &mut bg_task => {
             if let Err(e) =res {
               bail!("bluetooth session background task exited with error: {e}");
             }
           }
-          maybe_event = reader.next() => {
-            if let Some(Ok(event)) = maybe_event {
+          maybe_event = futures::future::ready(()).then(|_| reader.as_mut().unwrap().next()), if reader.is_some() => {
+            if let Some(Ok(Event::Key(key))) = maybe_event {
               match state {
                 State::Selecting => {
-                  if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
                       match key.code {
                         KeyCode::Char('q') => {
@@ -802,6 +825,12 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                           return Ok(())
                         },
                         KeyCode::Char('p') => {
+                          if repetition_count <= 100 {
+                            repetition_count += 1;
+                            continue;
+                          }
+                          reader = None;
+                          repetition_count = 0;
                           xdo.require_user_attention(1).expect("can't require user attention");
                           xdo.require_user_attention(1).expect("can't require user attention");
                           timeflip.pause().await?;
@@ -829,7 +858,7 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                         }
                         KeyCode::Char('b') => {
                           let date_selection_list = StatefulList::with_items(app.get_available_dates(), None);
-                          state = State::Booking {date_selection_list, booking_date: None, extended_info: false, jira_booker: 0};
+                          state = State::Booking {date_selection_list, booking_date: None, extended_info: false};
                         }
                         KeyCode::Char('t') => {
                           app.toggle_visibility();
@@ -882,11 +911,10 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                       }
                       textarea = TextArea::new(text);
                     }
-                  }
                 },
                 State::Editing => {
-                  match event.into() {
-                    Input {key: Key::Esc, ..}=> {
+                  match key {
+                    KeyEvent{ code: KeyCode::Esc, ..} => {
                       state = State::Selecting;
                       if let Some(editing_entry) = app.items.selected() {
                         let entry = app.entries.get_mut(editing_entry).expect("must be present");
@@ -900,8 +928,14 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                   }
                 }
                 State::Paused => {
-                  match event.into() {
-                    Input {key: Key::Char('p'), ..}=> {
+                  match key {
+                    KeyEvent{ code: KeyCode::Char('p'), ..} => {
+                      if repetition_count <= 100 {
+                        repetition_count += 1;
+                        continue;
+                      }
+                      reader = None;
+                      repetition_count = 0;
                       xdo.require_user_attention(0).expect("can't require user attention");
                       xdo.require_user_attention(0).expect("can't require user attention");
                       let now = Local::now();
@@ -912,39 +946,44 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                     _ => {},
                   }
                 },
-                State::Booking {ref mut date_selection_list, ref mut booking_date, ref mut extended_info, ref mut jira_booker} => {
-                  match event.into() {
-                    Input {key: Key::Esc, ..}=> {
+                State::Booking {ref mut date_selection_list, ref mut booking_date, ref mut extended_info} => {
+                  match key {
+                    KeyEvent{ code: KeyCode::Esc, ..} => {
                       state = State::Selecting;
                       if let Some(selected) = app.items.selected() {
                         textarea = TextArea::new(app.entries.get(selected).expect("must be present").description.to_vec());
                       }
                     }
-                    input => {
+                    key => {
                       match booking_date {
                         Some(date) => {
-                          match input {
-                            Input {key: Key::Char('+'), ..}=> {
+                          match key {
+                            KeyEvent{ code: KeyCode::Char('+'), .. } => {
                               date.modify_selected_entry(300);
                             },
-                            Input {key: Key::Char('-'), ..}=> {
+                            KeyEvent{ code: KeyCode::Char('-'), .. } => {
                               date.modify_selected_entry(-300);
                             },
-                            Input {key: Key::Down, ..}=> {
+                            KeyEvent{ code: KeyCode::Down, .. } => {
                               date.booking_list.next();
                             },
-                            Input {key: Key::Up, ..}=> {
+                            KeyEvent{ code: KeyCode::Up, ..}=> {
                               date.booking_list.previous();
                             }
-                            Input {key: Key::Char('e'), ..}=> {
+                            KeyEvent{ code: KeyCode::Char('e'), .. }=> {
                               *extended_info = !*extended_info;
                             },
-                            Input {key: Key::Char('b'), ..}=> {
-                              *jira_booker = *jira_booker + 1;
+                            KeyEvent{ code: KeyCode::Char('b'), .. }=> {
+                              if repetition_count <= 100 {
+                                repetition_count += 1;
+                                continue;
+                              }
+                              reader = None;
+                              repetition_count = 0;
                               let booking_data = date.prepare_jira_booking().await;
                               let show = |terminal: &mut Terminal<_>, title: String, data: &[(String, Duration)]| {
-                                terminal.draw(|f| {
-                                  let area = centered_rect(60, 25, f.size());
+                                let _ = terminal.draw(|f| {
+                                  let area = centered_rect(60, 25, f.area());
                                   let popup_block = Block::default()
                                       .title(title)
                                       .borders(Borders::NONE)
@@ -961,56 +1000,42 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
                                               );
                                 });
                               };
-                              if *jira_booker <= 3 {
-                                show(terminal, format!("Really book that? Question {}/3", *jira_booker), &booking_data);
-                                Delay::new(Duration::from_millis(2_000)).await;
-                              } else {
-                                let mut err = 0;
-                                let list = booking_data.clone();
-                                let mut prefix: HashMap<String, String> = HashMap::new();
-                                for (issue, duration) in booking_data {
-                                  match booker::book_time(
-                                             &config.jira_base_url,
-                                             &config.jira_user,
-                                             &config.jira_token,
-                                             issue.clone(),
-                                             date.date,
-                                             duration.clone(),
-                                         )
-                                         .await {
-                                    Ok(_) => { prefix.insert(issue, "OK".to_string());},
-                                    Err(e) => {
-                                      err = err + 1;
-                                      prefix.insert(issue, format!("[ERR({})]", e));
-                                    }
-                                  };
-                                  show(terminal, "Booking...".to_string(), &list.iter().map(|(issue, duration)| (format!("[{}] {}", prefix.get(issue).unwrap_or(&" ".to_string()), issue), duration.clone())).collect::<Vec<(String, Duration)>>());
-                                }
-                                show(terminal, format!("{}", if err > 0 { format!("Not okay, {} failed", err) } else { "Okay all booked!".to_string() }), &list.iter().map(|(issue, duration)| (format!("[{}] {}", prefix.get(issue).unwrap_or(&" ".to_string()), issue), duration.clone())).collect::<Vec<(String, Duration)>>());
-                                Delay::new(Duration::from_millis(5_000)).await;
+                              let mut err = 0;
+                              let list = booking_data.clone();
+                              let mut prefix: HashMap<String, String> = HashMap::new();
+                              for (issue, duration) in booking_data {
+                                match booker::book_time(
+                                           &config.jira_base_url,
+                                           &config.jira_user,
+                                           &config.jira_token,
+                                           issue.clone(),
+                                           date.date,
+                                           duration.clone(),
+                                       )
+                                       .await {
+                                  Ok(_) => { prefix.insert(issue, "OK".to_string());},
+                                  Err(e) => {
+                                    err = err + 1;
+                                    prefix.insert(issue, format!("[ERR({})]", e));
+                                  }
+                                };
+                                show(terminal, "Booking...".to_string(), &list.iter().map(|(issue, duration)| (format!("[{}] {}", prefix.get(issue).unwrap_or(&" ".to_string()), issue), duration.clone())).collect::<Vec<(String, Duration)>>());
                               }
+                              show(terminal, format!("{}", if err > 0 { format!("Not okay, {} failed", err) } else { "Okay all booked!".to_string() }), &list.iter().map(|(issue, duration)| (format!("[{}] {}", prefix.get(issue).unwrap_or(&" ".to_string()), issue), duration.clone())).collect::<Vec<(String, Duration)>>());
+                              Delay::new(Duration::from_millis(5_000)).await;
                             },
-                            input => {
-                              textarea.input(input);
-                              let parsed = chrono::NaiveTime::parse_from_str(&textarea.lines()[0], "%H:%M");
-                              if let Ok(duration) = parsed {
-                                let day = NaiveDate::from_ymd_opt(2023, 12, 24).unwrap();
-                                let start = chrono::NaiveTime::from_hms_milli_opt(00, 00, 00, 0000).unwrap();
-                                let delta: chrono::Duration = day.and_time(duration).signed_duration_since(day.and_time(start));
-                                date.actual_duration = Some(delta.to_std().expect("negative not supported"));
-                              }
-                            }
+                            _ => {}
                           }
                         },
                         None => {
-                          match input {
-                            Input {key: Key::Down, ..}=> {
+                          match key {
+                            KeyEvent{ code: KeyCode::Down, ..}=> {
                               date_selection_list.next();
                             },
-                            Input {key: Key::Up, ..}=> {
+                            KeyEvent{ code: KeyCode::Up, ..}=> {
                               date_selection_list.previous();
                             }
-                            Input {key: Key::Enter, ..}=> {
+                            KeyEvent{ code: KeyCode::Enter, ..}=> {
                               terminal.draw(|f| show_loading_window(f))?;
                               if let Some(date) = date_selection_list.selected() {
                                 let mut data = get_bookings_for_date(&app, &config, date).await;
@@ -1032,23 +1057,51 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, opt: Options) -> anyhow::Re
     }
 }
 
-fn show_main_window<B: Backend>(
-    f: &mut Frame<B>,
+fn show_hold_key(count: usize) -> Option<Gauge<'static>> {
+    if !(1..100).contains(&count) {
+        return None;
+    }
+    let label = Span::styled(
+        format!("Hold button {}%", count),
+        Style::new().italic().bold().fg(Color::White),
+    );
+    Some(
+        ratatui::widgets::Gauge::default()
+            .gauge_style(Style::default().fg(Color::Blue))
+            .ratio(count as f64 / 100.0)
+            .label(label),
+    )
+}
+
+fn show_main_window(
+    f: &mut Frame,
     buf: Rect,
     app: &mut App,
-    textarea: &TextArea,
+    textarea: &mut TextArea,
     state: &State,
     config: &Config,
+    repetition_count: usize,
 ) {
-    let inner_layout = Layout::default()
+    let inner_vert_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(buf);
+    let inner_hor_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(buf);
+        .split(inner_vert_layout[0]);
     let list_selected_color = match state {
         State::Selecting => Color::White,
         State::Editing | State::Paused => Color::Gray,
         _ => unreachable!("booking must not end up here"),
     };
+    if matches!(state, State::Editing) {
+      textarea.set_cursor_style(Style::default().bg(Color::White));
+      textarea.set_cursor_line_style(Style::default().fg(Color::White));
+    } else {
+      textarea.set_cursor_style(Style::default());
+      textarea.set_cursor_line_style(Style::default());
+    }
     let max_len = longest_facet_name(config);
     let items: Vec<ListItem> = app
         .items
@@ -1095,12 +1148,15 @@ fn show_main_window<B: Backend>(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ");
-    f.render_stateful_widget(items, inner_layout[0], &mut app.items.state);
-    f.render_widget(textarea.widget(), inner_layout[1]);
+    f.render_stateful_widget(items, inner_hor_layout[0], &mut app.items.state);
+    f.render_widget(&*textarea, inner_hor_layout[1]);
+    if let Some(hold_key) = show_hold_key(repetition_count) {
+        f.render_widget(hold_key, inner_vert_layout[1]);
+    }
 }
 
-fn show_loading_window<B: Backend>(f: &mut Frame<B>) {
-    let area = centered_rect(60, 25, f.size());
+fn show_loading_window(f: &mut Frame) {
+    let area = centered_rect(60, 25, f.area());
     let popup_block = Block::default()
         .title("Loading")
         .borders(Borders::NONE)
@@ -1134,20 +1190,20 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1] // Return the middle chunk
 }
 
-fn show_booking_window<B: Backend>(
-    f: &mut Frame<B>,
+fn show_booking_window(
+    f: &mut Frame,
     buf: Rect,
     app: &mut App,
-    textarea: &mut TextArea,
     state: &mut State,
     config: &Config,
+    repetition_count: usize,
 ) {
     let inner_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(buf);
@@ -1156,7 +1212,6 @@ fn show_booking_window<B: Backend>(
         date_selection_list,
         booking_date,
         extended_info,
-        jira_booker: _,
     } = state
     {
         (booking_date, date_selection_list, extended_info)
@@ -1166,7 +1221,7 @@ fn show_booking_window<B: Backend>(
 
     match booking_date {
         None => {
-            let area = centered_rect(60, 25, f.size());
+            let area = centered_rect(60, 25, f.area());
             let popup_block = Block::default()
                 .title("Select a date to book:")
                 .borders(Borders::NONE)
@@ -1318,31 +1373,26 @@ fn show_booking_window<B: Backend>(
                 )),
                 inner_layout[0],
             );
-            textarea.set_block(Block::default().borders(Borders::NONE));
-            let text_area = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(19), Constraint::Length(5)])
-                .split(inner_layout[1]);
-            f.render_widget(
-                Paragraph::new(format!("Time-tracker time: ",)),
-                text_area[0],
-            );
-            f.render_widget(textarea.widget(), text_area[1]);
+
             f.render_stateful_widget(
                 accumulated_items,
-                inner_layout[3],
+                inner_layout[2],
                 &mut booking_date.booking_list.state,
             );
+            if let Some(hold_key) = show_hold_key(repetition_count) {
+                f.render_widget(hold_key, inner_layout[3]);
+            }
         }
     }
 }
 
-fn ui<B: Backend>(
-    f: &mut Frame<B>,
+fn ui(
+    f: &mut Frame,
     app: &mut App,
     textarea: &mut TextArea,
     state: &mut State,
     config: &Config,
+    repetition_count: usize,
 ) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1352,7 +1402,7 @@ fn ui<B: Backend>(
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(f.size());
+        .split(f.area());
     let area = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(vec![Constraint::Min(0), Constraint::Length(45)])
@@ -1371,11 +1421,19 @@ fn ui<B: Backend>(
     let titles = vec![" TimeFlip2 ", " Jira "];
     let selected = match state {
         State::Selecting | State::Editing | State::Paused => {
-            show_main_window(f, main_layout[2], app, textarea, state, config);
+            show_main_window(
+                f,
+                main_layout[2],
+                app,
+                textarea,
+                state,
+                config,
+                repetition_count,
+            );
             0
         }
         State::Booking { .. } => {
-            show_booking_window(f, main_layout[2], app, textarea, state, config);
+            show_booking_window(f, main_layout[2], app, state, config, repetition_count);
             1
         }
     };

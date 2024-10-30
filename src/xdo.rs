@@ -21,7 +21,10 @@ impl XDoHandle {
                 code => bail!("xdo failed with code: {code}"),
             }
         }
-        Ok(Self { xdo: handle, window: active_id })
+        Ok(Self {
+            xdo: handle,
+            window: active_id,
+        })
     }
 
     pub fn require_user_attention(&self, attention: i32) -> anyhow::Result<()> {

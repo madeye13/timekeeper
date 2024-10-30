@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{bail, Context};
 use chrono::{offset::TimeZone, DateTime, NaiveDate, NaiveTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -45,8 +45,8 @@ struct SprintQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Sprint {
-    start_date: DateTime<Utc>,
-    end_date: DateTime<Utc>,
+    start_date: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
     goal: String,
     id: usize,
     name: String,
@@ -134,7 +134,8 @@ pub async fn get_sprint_issues_for_date(
             &[("startAt", &start_with.to_string())],
         )
         .await?;
-        let res: SprintQuery = serde_json::from_value(data)?;
+        let res = serde_json::from_value::<SprintQuery>(data.clone())
+            .context("could not parse sprint data")?;
         need_more_data = (res.values.len() + queried_sprints.len()) < res.jira.total;
         queried_sprints.extend_from_slice(&res.values);
         start_with = queried_sprints.len()
@@ -143,7 +144,10 @@ pub async fn get_sprint_issues_for_date(
     let current_sprint: Vec<_> = queried_sprints
         .iter()
         .filter_map(|e| {
-            if check_sprint_active(day_to_query, e.start_date, e.end_date) {
+            if e.start_date.is_none() || e.end_date.is_none() {
+                return None;
+            }
+            if check_sprint_active(day_to_query, e.start_date.unwrap(), e.end_date.unwrap()) {
                 Some(e.id)
             } else {
                 None
